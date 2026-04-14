@@ -1,0 +1,37 @@
+model:
+  name: EfficientNetUNet
+  backbone: efficientnet_b2
+  num_classes: 6
+  pretrained: true
+
+distillation:
+  temperature: 4.0
+  alpha: 0.5       # KL loss weight
+  beta: 0.3        # CE+Dice+Focal weight
+  gamma: 0.2       # Feature MSE weight
+  teacher_checkpoint: "checkpoints/teacher_best.pth"
+
+training:
+  epochs: 100
+  batch_size: 8          # Student is smaller — can use bigger batch
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+
+data:
+  processed_dir: "data/processed"
+  splits_dir: "data/splits"
+  img_size: 224
+  train_augmentation: true
+
+target_metrics:
+  min_miou: 0.74
+  min_accuracy: 0.90
+
+class_names:
+  - building
+  - land
+  - road
+  - vegetation
+  - water
+  - unlabeled
