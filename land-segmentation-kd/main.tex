@@ -1,0 +1,413 @@
+\documentclass[journal]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{cite}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\begin{document}
+
+\title{A Complete Teacher--Student Knowledge Distillation Pipeline for\
+Aerial Land Semantic Segmentation on the MBRSC Dubai Dataset}
+
+\author{First~Author,~\IEEEmembership{Member,~IEEE},
+        Second~Author,~\IEEEmembership{Member,~IEEE},
+        and~Third~Author,~\IEEEmembership{Senior Member,~IEEE}%
+\thanks{Manuscript received April 15, 2026.}%
+\thanks{First Author and Second Author are with the Department of Computer Vision, XYZ University, City, Country (e-mail: author@xyz.edu).}%
+\thanks{Third Author is with the Department of AI Systems, ABC Institute, City, Country.}%
+}
+
+\markboth{IEEE Transactions on \LaTeX{} Template,~Vol.~X, No.~X, April~2026}%
+{Author \MakeLowercase{\textit{et al.}}: Complete KD Pipeline for Aerial Land Segmentation}
+
+\maketitle
+
+\begin{abstract}
+This paper presents an end-to-end semantic segmentation system for aerial land-cover analysis using teacher--student knowledge distillation (KD). The system is implemented as a complete reproducible pipeline: (i) raw-tile preprocessing into class-index masks and training patches, (ii) high-capacity teacher training with a Swin-Base UNet++ architecture, (iii) student distillation with an EfficientNet-B2 UNet architecture, (iv) standardized evaluation with pixel-level metrics, and (v) deployment-oriented inference utilities. The teacher combines hierarchical transformer encoding, Atrous Spatial Pyramid Pooling (ASPP), dense UNet++ decoding, and deep supervision. The student uses a compact encoder--decoder with projection heads for feature-level mimicry. Distillation jointly optimizes hard supervision, soft-logit transfer (temperature-scaled Kullback--Leibler divergence), and multi-level feature regression. The implementation includes class-imbalance correction, mixed-precision training, gradient clipping, learning-rate scheduling, checkpointing, and TensorBoard instrumentation. This manuscript documents all technical details directly from the codebase so the work is publication-ready and fully auditable.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Semantic segmentation, aerial imagery, knowledge distillation, Swin Transformer, UNet++, EfficientNet, ASPP, deep supervision.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{A}{erial} semantic segmentation is a core primitive for urban monitoring, infrastructure analytics, water-resource tracking, and environmental planning. In practice, dense prediction quality must be balanced against inference efficiency: large transformer-based models are accurate but expensive, whereas lightweight convolutional models are deployable but less expressive. This work addresses that gap through a complete teacher--student KD pipeline tailored to high-resolution remote-sensing imagery.
+
+The implemented system targets a six-class segmentation problem (building, land, road, vegetation, water, unlabeled) and is organized as a full stack: data preprocessing, dataset handling, model definitions, training scripts, loss engineering, evaluation metrics, visual diagnostics, and inference scripts. The codebase is structured to support both research rigor and production-style reproducibility.
+
+\subsection{Contributions}
+The project contributes the following concrete technical elements:
+\begin{itemize}
+    \item A Swin-Base UNet++ teacher with ASPP bottleneck and deep supervision.
+    \item A compact EfficientNet-B2 UNet student with feature projection heads.
+    \item A three-term KD objective combining hard labels, soft labels, and feature mimicry.
+    \item Class-imbalance handling via inverse-frequency weights computed from training masks.
+    \item End-to-end engineering details: augmentation, mixed precision, clipping, scheduling, logging, checkpoint policies, and inference/visualization utilities.
+\end{itemize}
+
+\section{Dataset and Problem Setup}
+\subsection{Dataset Organization}
+The pipeline operates on the MBRSC-style Dubai semantic segmentation dataset, stored as tiled folders (Tile 1 to Tile 8), each with RGB images and RGB masks. The class vocabulary is:
+\begin{enumerate}
+    \item building
+    \item land
+    \item road
+    \item vegetation
+    \item water
+    \item unlabeled
+\end{enumerate}
+
+\subsection{Color-to-Class Mapping}
+Raw masks are RGB-valued and converted to integer labels using nearest-color assignment in Euclidean color space. Let $\mathbf{p}_i\in\mathbb{R}^3$ be pixel color and $\mathbf{c}_k$ class color for class $k\in\{0,\dots,5\}$. The assigned label is
+\begin{equation}
+\hat{y}_i = \arg\min_k \|\mathbf{p}_i-\mathbf{c}_k\|_2^2.
+\end{equation}
+This choice is robust to boundary anti-aliasing artifacts compared with strict exact-color matching.
+
+\subsection{Patch Extraction Pipeline}
+Each raw image/mask pair is:
+\begin{enumerate}
+    \item resized to $672\times672$ (divisible by tile size),
+    \item transformed to class-index mask,
+    \item tiled into non-overlapping $224\times224$ patches,
+    \item saved as PNG image patches and NumPy mask arrays.
+\end{enumerate}
+
+If tile size is $s=224$ and resized side length is $r=672$, each resized image yields $(r/s)^2=9$ patches.
+
+\subsection{Train/Validation Split}
+Patch IDs are split into train/validation sets via random split (default train ratio $0.8$) using a fixed random seed. Split IDs are serialized into text files (one ID per line) and consumed by the dataset loader.
+
+\subsection{Data Normalization and Augmentation}
+Image normalization uses ImageNet statistics:
+\begin{equation}
+\mu=(0.485,0.456,0.406), \quad \sigma=(0.229,0.224,0.225).
+\end{equation}
+Training augmentations include horizontal flip, vertical flip, random 90-degree rotation, and color jitter. Validation applies only normalization and tensor conversion.
+
+\section{Model Architectures}
+\subsection{Teacher: Swin-Base UNet++}
+\subsubsection{Encoder}
+The teacher encoder is \texttt{swin\_base\_patch4\_window7\_224} (timm, \texttt{features\_only=True}) with outputs from four stages. Channel dimensions are:
+\begin{equation}
+[128,\;256,\;512,\;1024].
+\end{equation}
+Feature tensors are converted to $\text{B}\times\text{C}\times\text{H}\times\text{W}$ layout when required.
+
+\subsubsection{ASPP Bottleneck}
+The deepest feature map is processed by ASPP with branches: one $1\times1$ conv branch, three $3\times3$ dilated branches (dilations 6, 12, 18), and one global-pooling branch. Concatenated branch outputs are projected to 512 channels.
+
+\subsubsection{UNet++ Dense Decoder}
+Decoder nodes use dense skip aggregation across scales. Each node is a residual dense block with mixed dilation (including dilation 2 in intermediate conv) to enlarge receptive field while preserving spatial detail.
+
+\subsubsection{Deep Supervision}
+During training, the model returns one main output and three auxiliary outputs from intermediate decoder levels. During evaluation/inference, only the main segmentation logits are returned.
+
+\subsection{Student: EfficientNet-B2 UNet}
+\subsubsection{Encoder}
+The student encoder is \texttt{efficientnet\_b2} (timm, \texttt{features\_only=True}, \texttt{out\_indices=(1,2,3,4)}). Effective channel dimensions are:
+\begin{equation}
+[24,\;48,\;120,\;352].
+\end{equation}
+
+\subsubsection{Decoder}
+A lightweight UNet-style decoder progressively upsamples and fuses skip features. Decoder channel path is approximately
+\begin{equation}
+(352+120)\to128,\quad(128+48)\to64,\quad(64+24)\to32,\quad32\to32.
+\end{equation}
+A $1\times1$ head maps to six classes.
+
+\subsubsection{Projection Heads for KD}
+To align student features with teacher feature dimensions, $1\times1$ projection heads are used:
+\begin{equation}
+128\to256,\quad64\to128,\quad32\to64.
+\end{equation}
+Returned student feature dict keys are \texttt{d3}, \texttt{d2}, \texttt{d1}.
+
+\section{Loss Functions and Distillation Objective}
+\subsection{Teacher Segmentation Loss}
+Teacher training uses a weighted sum:
+\begin{equation}
+\mathcal{L}_{\text{teacher-base}}=0.4\mathcal{L}_{\text{CE}}+0.4\mathcal{L}_{\text{Focal}}+0.2\mathcal{L}_{\text{Dice}}.
+\end{equation}
+If deep supervision outputs are present, each auxiliary output contributes an additional $0.4\,\mathcal{L}_{\text{teacher-base}}$.
+
+\subsection{Cross-Entropy with Class Weights}
+Class weights are loaded from \texttt{configs/class\_weights.npy} if available. They are computed from training masks using inverse frequency:
+\begin{equation}
+w_k = \frac{1}{n_k+1}, \quad
+\tilde{w}_k = \frac{6w_k}{\sum_j w_j},
+\end{equation}
+then clipped to $[0.5,5.0]$.
+
+\subsection{Focal Loss}
+For per-pixel CE term $\ell_{\text{CE}}$, with $p_t=\exp(-\ell_{\text{CE}})$ and focusing parameter $\gamma=2$:
+\begin{equation}
+\mathcal{L}_{\text{Focal}} = (1-p_t)^{\gamma}\,\ell_{\text{CE}}.
+\end{equation}
+
+\subsection{Dice Loss}
+With class-wise softmax probabilities and one-vs-rest masks:
+\begin{equation}
+\mathcal{L}_{\text{Dice}}=1-\frac{1}{C}\sum_{c=1}^{C}
+\frac{2\sum p_c y_c + \epsilon}{\sum p_c + \sum y_c + \epsilon},
+\end{equation}
+with $C=6$ and $\epsilon=10^{-6}$.
+
+\subsection{Knowledge Distillation Loss}
+Student optimization combines hard, soft, and feature losses:
+\begin{align}
+\mathcal{L}_{\text{hard}} &= 0.4\mathcal{L}_{\text{CE}} + 0.4\mathcal{L}_{\text{Focal}} + 0.2\mathcal{L}_{\text{Dice}}, \\
+\mathcal{L}_{\text{KL}} &= T^2\,\mathrm{KL}\Big(\log\mathrm{softmax}(\tfrac{z_s}{T}),\,\mathrm{softmax}(\tfrac{z_t}{T})\Big), \\
+\mathcal{L}_{\text{feat}} &= \frac{1}{|\mathcal{K}|}\sum_{k\in\mathcal{K}}\|f_s^k - \mathrm{Resize}(f_t^k)\|_2^2, \\
+\mathcal{L}_{\text{KD}} &= \beta\mathcal{L}_{\text{hard}} + \alpha\mathcal{L}_{\text{KL}} + \gamma\mathcal{L}_{\text{feat}}.
+\end{align}
+Default distillation hyperparameters are:
+\begin{equation}
+T=4.0,\quad \alpha=0.5,\quad \beta=0.3,\quad \gamma=0.2.
+\end{equation}
+
+\section{Training Pipeline}
+\subsection{Teacher Training Protocol}
+\textbf{Model:} Swin-Base UNet++ with deep supervision enabled.
+
+\textbf{Optimizer:} AdamW with differential learning rates:
+\begin{itemize}
+    \item encoder LR = $1\times10^{-5}$
+    \item non-encoder LR = $1\times10^{-4}$
+    \item weight decay = $1\times10^{-2}$
+\end{itemize}
+
+\textbf{Schedule:} linear warmup (10 epochs) followed by cosine decay for total 150 epochs.
+
+\textbf{Batching:} batch size 4 (GPU constrained setting), train/val DataLoaders with \texttt{pin\_memory=True} and persistent workers when workers $>0$.
+
+\textbf{Stability:}
+\begin{itemize}
+    \item Automatic Mixed Precision (AMP) on CUDA,
+    \item gradient clipping with max norm 1.0,
+    \item periodic validation every 5 epochs (plus epoch 1).
+\end{itemize}
+
+\textbf{Checkpoint policy:}
+\begin{itemize}
+    \item save best by mIoU to \texttt{teacher\_best.pth},
+    \item save best by pixel accuracy to \texttt{teacher\_best\_acc.pth},
+    \item save periodic state checkpoints every 25 epochs.
+\end{itemize}
+
+\subsection{Student KD Training Protocol}
+\textbf{Teacher loading:} teacher checkpoint loaded and frozen (all params \texttt{requires\_grad=False}).
+
+\textbf{Feature hooks:} forward hooks are attached to teacher decoder nodes (\texttt{node\_0\_1}, \texttt{node\_0\_2}, \texttt{node\_0\_3}) to capture intermediate features \texttt{d3}, \texttt{d2}, \texttt{d1}.
+
+\textbf{Student optimization:}
+\begin{itemize}
+    \item optimizer: AdamW, LR $1\times10^{-3}$, weight decay $1\times10^{-4}$,
+    \item scheduler: cosine annealing for 100 epochs,
+    \item batch size: 8,
+    \item AMP + gradient clipping (max norm 1.0).
+\end{itemize}
+
+\textbf{Validation/checkpoint:} validate every 5 epochs (plus epoch 1), save best student by mIoU to \texttt{student\_best.pth}.
+
+\subsection{Implementation-Level Training Algorithm}
+\begin{algorithm}[t]
+\caption{Student KD Training (per epoch)}
+\begin{algorithmic}[1]
+\For{each batch $(x,y)$}
+    \State Run frozen teacher: $(z_t, f_t)\leftarrow \mathcal{T}(x)$ (features via hooks)
+    \State Run student: $(z_s, f_s)\leftarrow \mathcal{S}(x)$
+    \State Compute $\mathcal{L}_{\text{KD}}=\beta\mathcal{L}_{\text{hard}}+\alpha\mathcal{L}_{\text{KL}}+\gamma\mathcal{L}_{\text{feat}}$
+    \State Backpropagate with AMP scaling
+    \State Unscale gradients and apply clip-norm ($1.0$)
+    \State Optimizer step and scaler update
+\EndFor
+\State Step LR scheduler
+\State Periodically evaluate mIoU/accuracy on validation loader
+\end{algorithmic}
+\end{algorithm}
+
+\section{Evaluation Methodology}
+\subsection{Primary Metrics}
+Given class set $\{0,\dots,C-1\}$:
+\begin{align}
+\text{IoU}_c &= \frac{TP_c}{TP_c+FP_c+FN_c},\\
+\text{mIoU} &= \frac{1}{C}\sum_{c=0}^{C-1}\text{IoU}_c,\\
+\text{Pixel Accuracy} &= \frac{\sum_c TP_c}{\text{all pixels}}.
+\end{align}
+
+\subsection{Extended Metrics}
+The evaluation module also supports:
+\begin{itemize}
+    \item per-class IoU,
+    \item macro F1 score,
+    \item streaming confusion matrix accumulation for epoch-level statistics.
+\end{itemize}
+
+\subsection{Streaming Confusion Matrix}
+Predictions and labels are accumulated into a $C\times C$ matrix without storing full dataset outputs in memory. This supports robust and efficient metric computation on large validation sets.
+
+\section{Comparative Results Against Published Models}
+To explicitly compare our implementation with recent literature, we include two paper baselines provided by the user: a hybrid Swin-UNet variant~\cite{sundarr2025hybrid} and an InceptionResNetV2-UNet transfer-learning model~\cite{faska2025inceptionresnet}. For fair reporting, all values should correspond to the same dataset split and identical metric definitions (mIoU, pixel accuracy, and macro F1).
+
+\begin{table}[t]
+\caption{Comparison With Published Segmentation Models}
+\label{tab:paper_comparison}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Model & mIoU (\%) & Accuracy (\%) & Macro F1 (\%) \\
+\midrule
+Hybrid Swin-UNet (paper)~\cite{sundarr2025hybrid} & -- & -- & -- \\
+InceptionResNetV2-UNet (paper)~\cite{faska2025inceptionresnet} & -- & -- & -- \\
+\midrule
+Our Teacher (Swin-Base UNet++) & -- & -- & -- \\
+Our Student (EfficientNet-B2 UNet, KD) & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In the codebase, comparison plots are now generated with a white background for publication consistency. The plotting script also accepts external paper baseline metrics (JSON input), so the same figure can overlay our teacher/student scores with paper-reported values.
+
+\section{Inference and Visualization Utilities}
+\subsection{Model-Agnostic Predictor}
+Inference code supports both teacher and student types with fallback loading paths (new architecture first, legacy model second). The predictor:
+\begin{enumerate}
+    \item converts BGR to RGB,
+    \item applies normalization,
+    \item runs forward pass,
+    \item applies argmax over logits,
+    \item computes softmax class probabilities,
+    \item produces colored masks and overlay visualizations.
+\end{enumerate}
+
+\subsection{Class Palette and Reporting}
+A fixed class color palette is used for rendering outputs. Pixel-wise class distribution summaries are computed and printed for each prediction, aiding qualitative sanity checks.
+
+\subsection{Evaluation Visualization Suite}
+The visualization module is engineered for publication-style figures including:
+\begin{itemize}
+    \item per-class IoU bar charts,
+    \item confusion matrix heatmaps,
+    \item sample prediction galleries,
+    \item precision/recall/F1 grouped charts,
+    \item class distribution plots,
+    \item teacher-vs-student comparison plots.
+\end{itemize}
+
+\section{Configuration and Reproducibility Details}
+\subsection{Teacher Configuration (from YAML)}
+\begin{itemize}
+    \item model name: \texttt{SwinUNetPlusPlus}
+    \item backbone: \texttt{swin\_base\_patch4\_window7\_224}
+    \item classes: 6
+    \item pretrained: true
+    \item deep supervision: true
+    \item epochs: 150
+    \item batch size: 4
+    \item optimizer: AdamW
+    \item encoder LR: $1\times10^{-5}$
+    \item decoder LR: $1\times10^{-4}$
+    \item weight decay: $1\times10^{-2}$
+    \item warmup epochs: 10
+    \item grad clip: 1.0
+\end{itemize}
+
+\subsection{Student Configuration (from YAML)}
+\begin{itemize}
+    \item model name: \texttt{EfficientNetUNet}
+    \item backbone: \texttt{efficientnet\_b2}
+    \item classes: 6
+    \item pretrained: true
+    \item KD temperature: 4.0
+    \item KD weights: $\alpha=0.5$, $\beta=0.3$, $\gamma=0.2$
+    \item teacher checkpoint: \texttt{checkpoints/teacher\_best.pth}
+    \item epochs: 100
+    \item batch size: 8
+    \item LR: $1\times10^{-3}$
+    \item weight decay: $1\times10^{-4}$
+\end{itemize}
+
+\subsection{Dependency Stack}
+The implementation relies on PyTorch, torchvision, timm, segmentation-models-pytorch, albumentations, OpenCV, NumPy, Matplotlib, TensorBoard, tqdm, PyYAML, scikit-learn, and Pillow. These are version-pinned with lower bounds in \texttt{requirements.txt}.
+
+\section{Complexity and Deployment Considerations}
+The teacher model is high-capacity and suited for best-accuracy operation; the student model is explicitly designed for lower latency and deployment efficiency. Distillation transfers richer supervision to preserve segmentation quality under reduced parameter budget.
+
+In practical deployment, model choice is task-dependent:
+\begin{itemize}
+    \item teacher for offline/accuracy-critical analysis,
+    \item student for real-time or resource-constrained execution.
+\end{itemize}
+
+\section{Limitations and Risk Notes}
+\begin{itemize}
+    \item Domain shift risk: performance may degrade on imagery distributions far from training data.
+    \item Label noise sensitivity: color-based mask conversion assumes consistent annotation palette.
+    \item Class imbalance remains challenging for rare classes despite weighting and focal modulation.
+    \item Hook-based feature extraction requires architectural consistency between teacher definitions and checkpoints.
+\end{itemize}
+
+\section{Conclusion}
+This work documents a complete, technically explicit IEEE-style pipeline for aerial land semantic segmentation with knowledge distillation. Every major component in the project is specified: preprocessing, dataset handling, architectures, losses, optimization, metrics, inference, and visualization. The resulting framework is both research-grade and implementation-grounded, enabling direct reproduction, extension, and manuscript submission.
+
+\appendices
+\section{Codebase Module Map}
+\begin{itemize}
+    \item \texttt{datasets/preprocess.py}: raw tile processing, color-to-class conversion, tiling, split generation.
+    \item \texttt{datasets/mbrsc\_dataset.py}: dataset loader, augmentations, tensor formatting.
+    \item \texttt{models/teacher/swin\_unet\_plus.py}: main teacher model.
+    \item \texttt{models/teacher/aspp.py}: ASPP bottleneck module.
+    \item \texttt{models/student/efficientnet\_unet.py}: student model + projection heads.
+    \item \texttt{training/losses.py}: focal, dice, teacher, and KD losses.
+    \item \texttt{training/train\_teacher.py}: teacher optimization loop.
+    \item \texttt{training/train\_student\_kd.py}: KD training loop with hooks.
+    \item \texttt{training/compute\_class\_weights.py}: inverse-frequency weighting.
+    \item \texttt{evaluation/metrics.py}: mIoU, accuracy, per-class IoU, F1, confusion matrix.
+    \item \texttt{evaluation/visualize.py}: publication-style evaluation plots.
+    \item \texttt{inference/predict.py}: single/batch prediction and overlays.
+\end{itemize}
+
+\section{Suggested Figure Placeholders for Final Paper}
+\begin{itemize}
+    \item System overview diagram (data $\rightarrow$ teacher training $\rightarrow$ KD $\rightarrow$ deployment).
+    \item Teacher and student architecture schematics.
+    \item Qualitative prediction gallery (input/GT/teacher/student).
+    \item Per-class IoU comparison chart.
+    \item Confusion matrices for teacher and student.
+\end{itemize}
+
+\begin{thebibliography}{99}
+\bibitem{hinton2015}
+G.~Hinton, O.~Vinyals, and J.~Dean, ``Distilling the knowledge in a neural network,'' \emph{arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem{swin2021}
+Z.~Liu \emph{et al.}, ``Swin transformer: Hierarchical vision transformer using shifted windows,'' in \emph{Proc. ICCV}, 2021.
+
+\bibitem{unetpp2018}
+Z.~Zhou, M.~M.~R. Siddiquee, N.~Tajbakhsh, and J.~Liang, ``UNet++: A nested U-Net architecture for medical image segmentation,'' in \emph{Deep Learning in Medical Image Analysis}, 2018.
+
+\bibitem{deeplabv3}
+L.-C. Chen, G.~Papandreou, F.~Schroff, and H.~Adam, ``Rethinking atrous convolution for semantic image segmentation,'' \emph{arXiv preprint arXiv:1706.05587}, 2017.
+
+\bibitem{efficientnet}
+M.~Tan and Q.~V. Le, ``EfficientNet: Rethinking model scaling for convolutional neural networks,'' in \emph{Proc. ICML}, 2019.
+
+\bibitem{sundarr2025hybrid}
+Sundarr \emph{et al.}, ``Enhanced aerial image segmentation via hybrid Swin-UNet with dilated convolutions and multi-scale fusion,'' 2025.
+
+\bibitem{faska2025inceptionresnet}
+Z.~Faska \emph{et al.}, ``Satellite imagery semantic segmentation using InceptionResNetV2-UNet transfer learning model,'' in \emph{Proc. 2025 International Conference on Control, Automation and Diagnosis (ICCAD)}, 2025, pp.~1--6, doi: 10.1109/ICCAD64771.2025.11099155.
+\end{thebibliography}
+
+\end{document}

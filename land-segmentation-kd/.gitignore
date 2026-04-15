@@ -18,3 +18,6 @@ outputs/
 *.onnx
 
 .ipynb_checkpoints/
+
+*.md
+*.sh

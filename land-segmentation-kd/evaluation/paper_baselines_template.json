@@ -1,0 +1,20 @@
+[
+  {
+    "name": "Hybrid Swin-UNet (paper)",
+    "miou": 0.00,
+    "accuracy": 0.00,
+    "f1_macro": 0.00,
+    "building_iou": 0.00,
+    "vegetation_iou": 0.00,
+    "water_iou": 0.00
+  },
+  {
+    "name": "InceptionResNetV2-UNet (ICCAD 2025)",
+    "miou": 0.00,
+    "accuracy": 0.00,
+    "f1_macro": 0.00,
+    "building_iou": 0.00,
+    "vegetation_iou": 0.00,
+    "water_iou": 0.00
+  }
+]
